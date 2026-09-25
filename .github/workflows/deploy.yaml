@@ -1,69 +1,72 @@
 name: Deploy
 
-on:
- push:
-   branches:
-     - main
- pull_request:
-   branches:
-     - main
-   
 
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
 
 jobs:
- Build:
-  runs-on: ubuntu-latest
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-  steps:
-   - uses:  actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-   - uses: actions/setup-node@v3
-     with:
-       node-version: '20'
+      - name: Install tools
+        run: |
+          pip install --upgrade pip
+          pip install "flask==3.1.3" "werkzeug==3.1.8" "waitress==3.0.2" \
+            "PyMySQL==1.2.3" "imapclient==4.1.0" ruff
 
-   - name: Set up Python 
-     uses: actions/setup-python@v5
-     with:
-       python-version: "3.12"
+      - name: Syntax check
+        run: python -m compileall -q sync account-manager tools
 
-   - name: Install dependencies
-     run: |
-      pip install --upgrade pip
-      pip install "flask==3.1.3" "werkzeug==3.1.8" "waitress==3.0.2" \
-        "PyMySQL==1.2.3" "imapclient==4.1.0" ruff
+      - name: Lint (serious errors only)
+        run: ruff check --select E9,F63,F7,F82 sync account-manager tools
 
-   - name: Syntax check
-     run: python -m compileall -q sync account-manager monitor
-   
-   - name: Lint (sirf serious errors)
-     run: ruff check --select E9,F63,F7,F82 sync account-manager monitor
+      - name: docker-compose.yml is valid (dummy secrets, never real ones)
+        run: |
+          printf 'DB_PASSWORD=x\nMYSQL_ROOT_PASSWORD=x\nROUNDCUBE_DES_KEY=x\nADMIN_PASSWORD_HASH=x\nSECRET_KEY=x\n' > .env
+          docker compose config --quiet
+          rm -f .env
 
-   - name: Trivy Scan
-     uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
-     with:
-      scan-type: fs
-      scan-ref: .
-      scanners: vuln,secret
-      severity: CRITICAL,HIGH
-      ignore-unfixed: true
-      format: table
-      exit-code: "1"
+      - name: Trivy scan (vulnerabilities + committed secrets)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
 
-
- Test_images:
+  images:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false         
+      fail-fast: false
       matrix:
-        image: [sync, account-manager, monitor]
+        image: [sync, account-manager]
     steps:
-      - uses: actions/checkout@v5
- 
+      - uses: actions/checkout@v4
+
       - name: Build ${{ matrix.image }} image
         run: docker build -t ${{ matrix.image }}:ci ./${{ matrix.image }}
- 
+
       - name: Trivy scan (${{ matrix.image }} image)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           scan-type: image
           image-ref: ${{ matrix.image }}:ci
@@ -71,17 +74,15 @@ jobs:
           ignore-unfixed: true
           format: table
           exit-code: "1"
- 
-  
- 
- Deploy:
-  runs-on: self-hosted
-  needs: [Build, Test_images]
-  steps:
-    - uses: actions/checkout@v6
-  
-    - name: Deploy to server 
-      run: |
-       cd ~/project/RoundCube_Mail-main
-       git pull origin main
-       docker compose up -d --build 
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, images]
+    runs-on: self-hosted
+    steps:
+      - name: Update code on the server and restart
+        run: |
+          cd ~/project/RoundCube_Mail-main
+          git pull --ff-only
+          docker compose up -d --build
+          docker compose ps

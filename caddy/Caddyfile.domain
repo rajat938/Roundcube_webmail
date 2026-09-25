@@ -11,3 +11,10 @@
 	header -Server
 	reverse_proxy account-manager:5000
 }
+
+# Webmail: set WEBMAIL_SITE=mail.yourdomain.com in .env (DNS -> this server)
+{$WEBMAIL_SITE} {
+	encode gzip
+	header -Server
+	reverse_proxy roundcube:80
+}

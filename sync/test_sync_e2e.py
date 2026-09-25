@@ -1,5 +1,4 @@
-# End-to-end test used during development (needs a fake-Hostinger Dovecot, local Dovecot, MariaDB).
-# Not needed in production.
+# Test used during development. Not needed in production.
 """End-to-end test of sync-pull + sync-push against a fake Hostinger
 (Dovecot, TLS, 80 ms RTT via proxy) and a local Dovecot mirror."""
 import email.utils, imaplib, os, random, ssl, subprocess, sys, time
@@ -192,8 +191,11 @@ try:
     lat = wait(lambda: bodies(H(), D, mid) == ["version 2"], 30)
     time.sleep(3)
     hd, ht = bodies(H(), D, mid), bodies(H(), T, mid)
-    report("draft edited -> Hostinger has ONLY the new version (old one not dumped in Trash)",
-           lat is not None and hd == ["version 2"] and ht == [], f"(Drafts {hd}, Trash {ht})")
+    TRASH_MODE = ENV.get("DRAFT_OLD_VERSIONS", "trash") == "trash"
+    report("draft edited -> Hostinger Drafts has ONLY the new version; old version "
+           + ("kept in Trash" if TRASH_MODE else "removed"),
+           lat is not None and hd == ["version 2"] and ht == (["version 1"] if TRASH_MODE else []),
+           f"(Drafts {hd}, Trash {ht})")
 
     l = L()   # Roundcube "Send": save to Sent (same Message-ID), then delete the draft
     l.append(f'"{S}"', "(\\Seen)", None, draft_raw(mid, "version 2"))
@@ -201,8 +203,9 @@ try:
     lat = wait(lambda: not find(H(), D, mid), 30)
     time.sleep(5)
     hs, ht = len(find(H(), S, mid)), len(find(H(), T, mid))
-    report("draft sent -> gone from Hostinger Drafts, in Hostinger Sent once, not in Trash",
-           lat is not None and hs == 1 and ht == 0, f"(Sent {hs}, Trash {ht})")
+    report("draft sent -> gone from Hostinger Drafts, in Hostinger Sent once"
+           + (", draft copies kept in Trash" if TRASH_MODE else ", not in Trash"),
+           lat is not None and hs == 1 and (ht == 2 if TRASH_MODE else ht == 0), f"(Sent {hs}, Trash {ht})")
 
     mid2 = f"<draft{random.randint(0, 10**12)}@test>"
     save_draft(L(), mid2, "throw away")

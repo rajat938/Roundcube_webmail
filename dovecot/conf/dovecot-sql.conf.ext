@@ -1,5 +1,0 @@
-driver = mysql
-connect = host=roundcube-db dbname=roundcubemail user=roundcube password=77bd0d92b43d73ac
-default_pass_scheme = PLAIN
-password_query = SELECT email as user, password FROM dovecot_users WHERE email='%u'
-user_query = SELECT '/var/mail/%u' as home, 5000 AS uid, 5000 AS gid FROM dovecot_users WHERE email='%u'

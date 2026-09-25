@@ -1,4 +1,4 @@
-# HTTPS front door for the account manager.
+# HTTPS front door for the account manager (8443) and webmail (8444).
 #
 # Default: https://<server-ip>:8443 with a certificate Caddy makes itself
 # (browser shows a one-time warning; traffic is still fully encrypted).
@@ -17,4 +17,16 @@
 	encode gzip
 	header -Server
 	reverse_proxy account-manager:5000
+}
+
+# Webmail (Roundcube) over HTTPS -- plain HTTP 8081 is only open on the
+# server itself now.
+{$WEBMAIL_SITE::8444} {
+	tls {$ADMIN_TLS:internal} {
+		on_demand
+	}
+	encode gzip
+	header -Server
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy roundcube:80
 }
