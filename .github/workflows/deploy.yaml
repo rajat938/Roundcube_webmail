@@ -32,10 +32,6 @@ jobs:
       pip install "flask==3.1.3" "werkzeug==3.1.8" "waitress==3.0.2" \
         "PyMySQL==1.2.3" "imapclient==4.1.0" ruff
 
- Test_Code:
-  runs-on: ubuntu-latest
-  steps:
-   - uses:  actions/checkout@v6
    - name: Syntax check
      run: python -m compileall -q sync account-manager monitor
    
