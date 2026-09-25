@@ -73,7 +73,9 @@ if not DB["user"] or not DB["password"]:
     sys.exit("DB_USER / DB_PASSWORD are not set -- put them in .env")
 
 ADMIN_USERNAME = env("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD_HASH = env("ADMIN_PASSWORD_HASH", "")
+# A real hash never contains "$$"; if it does, docker compose escaping
+# doubled the $ signs -- undo that so the login still works.
+ADMIN_PASSWORD_HASH = env("ADMIN_PASSWORD_HASH", "").strip().strip("'\"").replace("$$", "$")
 if not ADMIN_PASSWORD_HASH or ":" not in ADMIN_PASSWORD_HASH:
     sys.exit("ADMIN_PASSWORD_HASH is not set. Run:\n"
              "  docker compose run --rm account-manager python3 /app/app.py setup\n"
@@ -166,6 +168,15 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sync_settings (
         name VARCHAR(64) NOT NULL PRIMARY KEY,
         value VARCHAR(255) NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS sync_guard (
+        account_email VARCHAR(255) NOT NULL,
+        guard VARCHAR(64) NOT NULL,
+        message VARCHAR(500) NOT NULL,
+        item_count INT NOT NULL DEFAULT 0,
+        auto_minutes INT DEFAULT NULL,
+        first_seen DATETIME NOT NULL,
+        approved TINYINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (account_email, guard))""",
 ]
 
 
@@ -351,6 +362,8 @@ BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .acts form{margin:0}
  .banner{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
  a{color:var(--acc)}
+ .hold{border:1px solid #b26a00;border-radius:8px;padding:10px 12px;margin-top:10px}
+ .hold .row{align-items:flex-start}
 </style>{% if refresh %}<meta http-equiv="refresh" content="10">{% endif %}</head><body><div class="wrap">
 {% with msgs = get_flashed_messages(with_categories=true) %}{% for cat, m in msgs %}
 <div class="msg {{cat}}">{{m}}</div>{% endfor %}{% endwith %}
@@ -385,6 +398,11 @@ Username <code>{{shown.email}}</code> &nbsp; Password <code>{{shown.password}}</
 {% for a in accounts %}<div class="card acct">
 <div class="row"><h2>{{a.email}}</h2><span class="pill {{a.cls}}">{{a.label}}</span></div>
 <div class="mut">{{a.detail}}</div>
+{% for g in a.holds %}<div class="hold"><div class="row"><div><b>Waiting for you:</b> {{g.message}}<br>
+<span class="mut">Since {{g.since}}{% if g.auto %} -- goes ahead by itself {{g.auto}} if nothing changes{% endif %}{% if g.approved %} -- approved, applying at the next check{% endif %}</span></div>
+{% if not g.approved %}<form method="post" action="{{ url_for('approve') }}"><input type="hidden" name="csrf" value="{{csrf}}">
+<input type="hidden" name="email" value="{{a.email}}"><input type="hidden" name="guard" value="{{g.guard}}">
+<button class="small">Approve</button></form>{% endif %}</div></div>{% endfor %}
 {% if a.remote %}
 <div class="bar {{'done' if a.pending == 0 else ''}}"><span style="width:{{a.pct}}%"></span></div>
 <div class="nums"><span><b>{{a.pct_text}}</b> synced</span>
@@ -474,10 +492,20 @@ def list_accounts():
             progress = {}
             for row in cur.fetchall():
                 progress.setdefault(row[0], []).append(row[1:])
+            cur.execute("SELECT account_email, guard, message, auto_minutes, approved, "
+                        "TIMESTAMPDIFF(SECOND, first_seen, NOW()) FROM sync_guard ORDER BY first_seen")
+            holds = {}
+            for em, guard, message, auto, approved, age in cur.fetchall():
+                left = (auto * 60 - (age or 0)) if auto is not None else None
+                holds.setdefault(em, []).append(dict(
+                    guard=guard, message=message, approved=bool(approved), since=_ago(age),
+                    auto=(f"in about {_duration(max(left, 60))}" if left is not None and left > 0
+                          else ("at the next check" if left is not None else ""))))
     finally:
         conn.close()
 
     for a in accounts:
+        a["holds"] = holds.get(a["email"], [])
         st = status.get(a["email"])
         a["syncing"] = a["active"] and not paused
         # --- headline status
@@ -497,6 +525,9 @@ def list_accounts():
                           "error": "Problem", "stopped": "Stopped"}.get(state, state.title())
             a["cls"] = {"up to date": "on", "error": "bad", "stopped": "bad"}.get(state, "warn")
             a["detail"] = detail
+        if a["holds"] and a["syncing"]:
+            a["label"], a["cls"] = "Waiting for you", "warn"
+            a["detail"] = "A bulk change is on hold -- see below."
         # --- push line
         if not a["syncing"]:
             a["push"] = "stopped"
@@ -580,6 +611,26 @@ def logout():
 @app.get("/")
 def index():
     return main_page(refresh=request.args.get("refresh") == "1")
+
+
+@app.post("/approve")
+def approve():
+    email_addr = form_email()
+    guard = request.form.get("guard", "")
+    if not email_addr or not re.fullmatch(r"[a-z]+(-[a-z]+)?(:[A-Za-z0-9._ -]{1,200})?", guard):
+        abort(400)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            n = cur.execute("UPDATE sync_guard SET approved=1 WHERE account_email=%s AND guard=%s",
+                            (email_addr, guard))
+        conn.commit()
+    finally:
+        conn.close()
+    if n:
+        log.info("HELD ACTION APPROVED %s / %s by %s", email_addr, guard, session.get("user"))
+        flash("Approved -- the sync applies it at its next check (usually within 30 seconds).", "ok")
+    return redirect(url_for("index"))
 
 
 @app.post("/sync")

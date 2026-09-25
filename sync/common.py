@@ -199,6 +199,26 @@ class SafeRemoteIMAP(imaplib.IMAP4_SSL):
         return super()._command(name, *args)
 
 
+_IDLE_ALLOWED = {"CAPABILITY", "LOGIN", "AUTHENTICATE", "EXAMINE", "IDLE", "NOOP", "LOGOUT", "ID",
+                 "NAMESPACE", "ENABLE"}
+
+
+def lock_down_idle_client(client):
+    """The IDLE watcher uses IMAPClient (not SafeRemoteIMAP). Put the same
+    kind of hard allow-list on it: login, read-only EXAMINE, IDLE, NOOP,
+    LOGOUT. (IDLE only waits for server notifications; DONE ends it.)"""
+    imap = client._imap
+    original = imap._command
+
+    def guarded(name, *args):
+        if str(name).upper() not in _IDLE_ALLOWED:
+            raise ForbiddenCommand(f"{name} is not allowed on the IDLE connection")
+        return original(name, *args)
+
+    imap._command = guarded
+    return client
+
+
 def remote_ssl_context():
     """TLS 1.2+, certificate AND hostname verified (Python defaults,
     made explicit so nobody weakens them by accident)."""
@@ -484,8 +504,23 @@ def flags_from_db(value):
     return tracked((value or "").split())
 
 
+# Flags that may travel to Hostinger with an uploaded message. Anything else
+# -- above all \Deleted (Roundcube's "flag for deletion" mode) -- is dropped,
+# so an upload can never arrive on Hostinger already marked for deletion.
+_UPLOAD_FLAGS = {"\\seen": "\\Seen", "\\answered": "\\Answered", "\\flagged": "\\Flagged",
+                 "\\draft": "\\Draft"}
+
+
+def upload_flags(flags):
+    keep = sorted({_UPLOAD_FLAGS[f.lower()] for f in (flags or ()) if f.lower() in _UPLOAD_FLAGS})
+    return f"({' '.join(keep)})" if keep else None
+
+
 def appendable_flags(flags):
-    keep = [f for f in (flags or ()) if f.lower() != "\\recent"]
+    """Flags for a copy written into the LOCAL mirror: everything except
+    \Recent (server-managed) and \Deleted (a pending delete must not be
+    mirrored -- the mail would vanish locally on the next expunge)."""
+    keep = [f for f in (flags or ()) if f.lower() not in ("\\recent", "\\deleted")]
     return f"({' '.join(keep)})" if keep else None
 
 
@@ -597,6 +632,21 @@ SCHEMA = [
     CREATE TABLE IF NOT EXISTS sync_settings (
         name VARCHAR(64) NOT NULL PRIMARY KEY,
         value VARCHAR(255) NOT NULL
+    )
+    """,
+    # Actions a safety guard is holding back (shown in the admin page with an
+    # Approve button). count = how many items; first_seen restarts whenever
+    # the count changes, so "stable for N minutes" means really stable.
+    """
+    CREATE TABLE IF NOT EXISTS sync_guard (
+        account_email VARCHAR(255) NOT NULL,
+        guard VARCHAR(64) NOT NULL,
+        message VARCHAR(500) NOT NULL,
+        item_count INT NOT NULL DEFAULT 0,
+        auto_minutes INT DEFAULT NULL,
+        first_seen DATETIME NOT NULL,
+        approved TINYINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (account_email, guard)
     )
     """,
     # Existing table from the old daemon; reused so already-uploaded sent
@@ -743,6 +793,36 @@ class Database:
             f"{service}_heartbeat) VALUES (%s,%s,%s,NOW()) ON DUPLICATE KEY UPDATE "
             f"{service}_state=VALUES({service}_state), {service}_detail=VALUES({service}_detail), "
             f"{service}_heartbeat=NOW()", (account, state, (detail or "")[:255]))
+
+    # --- safety guards -------------------------------------------------
+    def guard_decide(self, account, guard, message, count, auto_minutes=None):
+        """Called while a guard is tripped. Returns True when the held
+        action may go ahead now: either the admin pressed Approve, or
+        (auto_minutes set) the exact same situation has persisted that long
+        -- a glitch doesn't last, a real bulk delete does."""
+        row = self.fetchone(
+            "SELECT item_count, approved, TIMESTAMPDIFF(SECOND, first_seen, NOW()) "
+            "FROM sync_guard WHERE account_email=%s AND guard=%s", (account, guard))
+        if row and row[1]:
+            self.guard_clear(account, guard)
+            return True
+        if row and int(row[0]) == int(count):
+            if auto_minutes is not None and row[2] is not None and row[2] >= auto_minutes * 60:
+                self.guard_clear(account, guard)
+                return True
+            self.execute("UPDATE sync_guard SET message=%s WHERE account_email=%s AND guard=%s",
+                         (message[:500], account, guard))
+            return False
+        # new, or the number changed -> (re)start the clock
+        self.execute(
+            "INSERT INTO sync_guard (account_email, guard, message, item_count, auto_minutes, first_seen, approved) "
+            "VALUES (%s,%s,%s,%s,%s,NOW(),0) ON DUPLICATE KEY UPDATE message=VALUES(message), "
+            "item_count=VALUES(item_count), auto_minutes=VALUES(auto_minutes), first_seen=NOW(), approved=0",
+            (account, guard, message[:500], int(count), auto_minutes))
+        return False
+
+    def guard_clear(self, account, guard):
+        self.execute("DELETE FROM sync_guard WHERE account_email=%s AND guard=%s", (account, guard))
 
     # --- drafts ---------------------------------------------------------
     def draft_states(self, account):

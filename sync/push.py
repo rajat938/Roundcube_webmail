@@ -24,7 +24,7 @@ import time
 
 from common import (
     Backoff, Database, DRAFTS_FOLDER, SENT_FOLDER, TRASH_FOLDER, SyncError, HEADER_ITEM,
-    _env, _env_bool, appendable_flags, appenduid, capabilities, check, chunks,
+    _env, _env_bool, appendable_flags, appenduid, capabilities, check, chunks, upload_flags,
     content_hash, describe, enable_condstore,
     flags_to_db, is_message_id, list_folders, local_connect, log, msg_key, q,
     remote_connect, safe_logout, status, supervise, tracked, uid_fetch,
@@ -44,7 +44,11 @@ SYNC_DRAFTS = _env_bool("SYNC_DRAFTS", True)
 #             is always moved to Trash instead.
 #   trash  -> every old copy is moved to Hostinger's Trash.
 # A draft you DELETE in Roundcube is always moved to Hostinger's Trash.
-DRAFT_OLD_VERSIONS = _env("DRAFT_OLD_VERSIONS", "remove").strip().lower()
+DRAFT_OLD_VERSIONS = _env("DRAFT_OLD_VERSIONS", "trash").strip().lower()
+# Safety net: if more drafts than this look "deleted in Roundcube" in one
+# pass (e.g. the local mail folder came up empty after a restore or a
+# wrong volume path), do NOTHING on Hostinger and log a warning instead.
+DRAFT_MASS_DELETE_LIMIT = int(_env("DRAFT_MASS_DELETE_LIMIT", "3"))
 
 
 class Pusher:
@@ -61,6 +65,7 @@ class Pusher:
         self.folders_at = 0
         self._status = (None, None)
         self._status_at = 0
+        self.drafts_problem = None
 
     def status(self, state, detail=""):
         now = time.time()
@@ -110,7 +115,10 @@ class Pusher:
                 self.check_folder(folder)
             if self.remote and time.time() - self.remote_last_used > REMOTE_IDLE_CLOSE_SECONDS:
                 self.close_remote()
-            self.status("up to date", "watching Roundcube for changes")
+            if self.drafts_problem:
+                self.status("error", self.drafts_problem)
+            else:
+                self.status("up to date", "watching Roundcube for changes")
             self.stop.wait(PUSH_POLL_SECONDS)
 
     # ------------------------------------------------------------------
@@ -161,15 +169,16 @@ class Pusher:
             if folder == SENT_FOLDER:
                 self.catch_up_sent()
             elif folder == DRAFTS_FOLDER and SYNC_DRAFTS:
-                self.sync_drafts()
+                if not self.sync_drafts():
+                    return
             self.save(folder, st)
             return
         if st["HIGHESTMODSEQ"] == state["local_modseq"]:
             return  # nothing changed locally -> nothing to do
 
         if folder == DRAFTS_FOLDER and SYNC_DRAFTS:
-            self.sync_drafts()
-            self.save(folder, st)
+            if self.sync_drafts():
+                self.save(folder, st)   # not saved while blocked -> re-checked every poll
             return
         if folder == SENT_FOLDER and st["UIDNEXT"] > (state.get("local_uidnext") or 0):
             self.push_sent_since(int(state.get("local_uidnext") or 1))
@@ -256,7 +265,7 @@ class Pusher:
                         continue
                 flags = set(r.flags or ()) | {"\\Seen"}
                 date = f'"{r.internaldate}"' if r.internaldate else None
-                typ, data = self.remote.append(q(SENT_FOLDER), appendable_flags(flags), date, bytes(r.data))
+                typ, data = self.remote.append(q(SENT_FOLDER), upload_flags(flags), date, bytes(r.data))
                 check(typ, data, "APPEND to Hostinger Sent")
                 self.remote_selected = None
                 ruid = appenduid(data)
@@ -340,7 +349,7 @@ class Pusher:
         self.ensure_remote()
         flags = set(r.flags or ()) | {"\\Draft", "\\Seen"}
         date = f'"{r.internaldate}"' if r.internaldate else None
-        typ, data = self.remote.append(q(DRAFTS_FOLDER), appendable_flags(flags), date, bytes(r.data))
+        typ, data = self.remote.append(q(DRAFTS_FOLDER), upload_flags(flags), date, bytes(r.data))
         check(typ, data, "APPEND to Hostinger Drafts")
         self.remote_selected = None
         ruid = appenduid(data)
@@ -388,22 +397,55 @@ class Pusher:
             else:
                 uploaded += 1
 
+        # drafts that disappeared locally: sent (-> leave Drafts) or deleted
+        # (-> Hostinger Trash).
+        vanished = [k for k, v in states.items() if k not in local and v[0] is not None]
+        sent_keys = {k for k in vanished if self.in_local_sent(k)}
+        not_sent = [k for k in vanished if k not in sent_keys]
+        tracked_remote = sum(1 for v in states.values() if v[0] is not None)
+        hold_deletes = False
+        if (len(not_sent) > DRAFT_MASS_DELETE_LIMIT
+                or (not local and tracked_remote >= 2 and not_sent)):
+            # Many drafts gone from Roundcube at once: a real clean-up, or a
+            # local mail folder that came up empty (restore, wrong volume).
+            # Moving Hostinger's drafts to Trash waits for the admin's OK --
+            # everything else (new/edited/sent drafts) keeps syncing.
+            msg = (f"{len(not_sent)} drafts disappeared from Roundcube at once -- NOT moved to "
+                   f"Hostinger's Trash yet. If you deleted them, press Approve; if not, check the "
+                   f"local mail folder.")
+            if self.db.guard_decide(acc, "push-drafts", msg, len(not_sent), None):
+                log.info("%s drafts: bulk delete of %d approved -- applying", self.tag, len(not_sent))
+            else:
+                hold_deletes = True
+                if msg != self.drafts_problem:
+                    log.warning("%s %s", self.tag, msg)
+                self.drafts_problem = msg
+        else:
+            self.db.guard_clear(acc, "push-drafts")
+        if not hold_deletes:
+            self.drafts_problem = None
+
         for key, (ruid, _h, origin) in states.items():
             if key in local:
                 continue
-            if ruid is not None:
-                reason = "sent" if self.in_local_sent(key) else "deleted"
-                self.retire_remote_draft(ruid, origin, reason)
-                self.db.delete_map_uids(acc, DRAFTS_FOLDER, [ruid])
-                if reason == "sent":
-                    sent += 1
-                else:
-                    deleted += 1
+            if ruid is None:
+                self.db.delete_draft_state(acc, key)
+                continue
+            reason = "sent" if key in sent_keys else "deleted"
+            if reason == "deleted" and hold_deletes:
+                continue          # held until approved
+            self.retire_remote_draft(ruid, origin, reason)
+            self.db.delete_map_uids(acc, DRAFTS_FOLDER, [ruid])
             self.db.delete_draft_state(acc, key)
+            if reason == "sent":
+                sent += 1
+            else:
+                deleted += 1
 
         if uploaded or replaced or sent or deleted:
-            log.info("%s drafts -> Hostinger: %d new, %d updated, %d sent (removed from Drafts), "
+            log.info("%s drafts -> Hostinger: %d new, %d updated, %d sent (left Drafts), "
                      "%d deleted (moved to Trash)", self.tag, uploaded, replaced, sent, deleted)
+        return not hold_deletes   # while held: folder re-checked every poll
 
     def already_on_hostinger(self, key):
         if self.db.fetchone("SELECT 1 FROM sent_upload_state WHERE account_email=%s AND message_id=%s",

@@ -1,4 +1,5 @@
-FROM roundcube/roundcubemail:latest
+# Pinned: "latest" could silently jump to a new major version on rebuild.
+FROM roundcube/roundcubemail:1.7.4-apache
 
 RUN apt-get update -qq \
     && apt-get install -y -qq ca-certificates \

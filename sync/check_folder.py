@@ -6,9 +6,13 @@ difference. Optionally download what is missing. Never changes Hostinger.
   docker exec mail-sync-pull python3 /app/check_folder.py EMAIL FOLDER --fetch-missing
   docker exec mail-sync-pull python3 /app/check_folder.py EMAIL FOLDER --fetch-missing --include-deleted
 
+Every copy counts: if Hostinger has the same Message-ID twice, Roundcube
+should have it twice too.
+
 Categories:
-  duplicate on Hostinger  same mail stored more than once on Hostinger;
-                          the mirror keeps one copy (nothing missing)
+  extra copies missing    Hostinger has more copies of a mail (same
+                          Message-ID) than Roundcube -- --fetch-missing
+                          downloads the missing copies
   deleted in Roundcube    was downloaded, later deleted/moved locally
                           (kept out on purpose; --include-deleted restores)
   never downloaded        a real gap -- --fetch-missing downloads these
@@ -65,7 +69,10 @@ def main():
     remote, local = remote_connect(acc), local_connect(acc)
     try:
         r_idx, l_idx = index(remote, folder), index(local, folder)
-        local_keys = {k for _u, k, _h in l_idx if k}
+        local_count = defaultdict(int)
+        for _u, k, _h in l_idx:
+            if k:
+                local_count[k] += 1
         mapped = {int(u) for (u,) in db.fetchall(
             "SELECT remote_uid FROM sync_msg_map WHERE account_email=%s AND folder=%s", (acc.email, folder))}
 
@@ -73,37 +80,42 @@ def main():
         for uid, key, head in r_idx:
             by_key[key].append((uid, head))
 
-        dup, deleted, never, nokey = [], [], [], []
+        extra, deleted, never, nokey = [], [], [], []
         for key, items in by_key.items():
             if key is None:
                 nokey.extend(items)
                 continue
-            if key in local_keys:
-                dup.extend(items[1:])          # first copy is the one in Roundcube
+            items.sort()
+            have = local_count.get(key, 0)
+            if have >= len(items):
                 continue
-            first, rest = items[0], items[1:]
-            dup.extend(rest)
-            (deleted if any(u in mapped for u, _h in items) else never).append(first)
+            if have:
+                extra.extend(items[have:])     # Roundcube has some copies, not all
+            elif any(u in mapped for u, _h in items):
+                deleted.extend(items)          # was downloaded, then removed locally
+            else:
+                never.extend(items)
 
         print(f"\n{acc.email}  {folder}")
         print(f"  on Hostinger              {len(r_idx):6,}")
         print(f"  in Roundcube (local)      {len(l_idx):6,}")
         print(f"  ------------------------------------")
-        print(f"  duplicate on Hostinger    {len(dup):6,}   (same mail twice on Hostinger -- nothing missing)")
+        print(f"  extra copies missing      {len(extra):6,}   (same Message-ID, Hostinger has more copies)")
         print(f"  deleted in Roundcube      {len(deleted):6,}   (downloaded, then deleted/moved locally)")
         print(f"  never downloaded          {len(never):6,}   (real gap)")
         if nokey:
             print(f"  unidentifiable            {len(nokey):6,}   (no Message-ID/Date/From/Subject)")
-        for title, items in (("never downloaded", never), ("deleted in Roundcube", deleted)):
+        for title, items in (("never downloaded", never), ("extra copies missing", extra),
+                             ("deleted in Roundcube", deleted)):
             if items:
                 print(f"\n  first {min(10, len(items))} {title}:")
                 for _u, head in items[:10]:
                     print("    " + describe(head))
 
-        todo = list(never) + (list(deleted) if include_deleted else [])
+        todo = list(never) + list(extra) + (list(deleted) if include_deleted else [])
         if not fetch:
-            if never or deleted:
-                print("\n  To download the 'never downloaded' ones:  add --fetch-missing"
+            if never or extra or deleted:
+                print("\n  To download 'never downloaded' + 'extra copies missing':  add --fetch-missing"
                       "\n  To also bring back the ones deleted in Roundcube:  add --include-deleted")
             return
         if not todo:

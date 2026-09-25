@@ -23,7 +23,8 @@ import time
 from imapclient import IMAPClient
 
 from common import (
-    Backoff, Database, DRAFTS_FOLDER, SyncError, TRACKED_FLAGS, HEADER_ITEM, _env, _env_bool,
+    Backoff, Database, DRAFTS_FOLDER, TRASH_FOLDER, SyncError, TRACKED_FLAGS, HEADER_ITEM, _env, _env_bool,
+    lock_down_idle_client,
     appendable_flags, check, chunks, content_hash, describe, enable_condstore, flags_to_db,
     check_remote_host, is_message_id, list_folders, local_connect, log, msg_key, q, remote_connect,
     remote_ssl_context, safe_logout, status, supervise, tracked, uid_fetch,
@@ -35,6 +36,14 @@ OTHER_FOLDERS_SECONDS = int(_env("OTHER_FOLDERS_SECONDS", "60"))      # STATUS c
 FOLDER_DISCOVERY_SECONDS = int(_env("FOLDER_DISCOVERY_SECONDS", "600"))
 FLAG_RESCAN_SECONDS = int(_env("FLAG_RESCAN_SECONDS", "300"))         # only if Hostinger lacks CONDSTORE
 REMOTE_DELETE_CHECK_SECONDS = int(_env("REMOTE_DELETE_CHECK_SECONDS", "300"))
+# Never act on more than this many Hostinger-side deletions in one pass
+# (a flaky/empty server answer must not empty the local mirror).
+REMOTE_DELETE_MAX_PER_PASS = int(_env("REMOTE_DELETE_MAX_PER_PASS", "20"))
+# A bulk delete on Hostinger that is still true after this many minutes of
+# re-checks is real (a glitch doesn't last) -> go ahead. Or press Approve.
+GUARD_CONFIRM_MINUTES = int(_env("GUARD_CONFIRM_MINUTES", "15"))
+# Drafts disappearing from Hostinger: up to this many at once is normal.
+DRAFT_VANISH_LIMIT = int(_env("DRAFT_VANISH_LIMIT", "3"))
 IDLE_CHECK_SECONDS = int(_env("IDLE_CHECK_SECONDS", "20"))
 IDLE_REFRESH_SECONDS = int(_env("IDLE_REFRESH_SECONDS", str(25 * 60)))
 FORCE_NO_CONDSTORE = _env_bool("FORCE_NO_CONDSTORE", False)
@@ -60,6 +69,7 @@ class Puller:
         self.inbox_event = threading.Event()
         self._status = (None, None)
         self._status_at = 0
+        self.problems = {}   # guard name -> message shown on the admin page
         self._progress_at = 0
         self._folder_progress_at = {}
         self._remote_total = None
@@ -113,6 +123,24 @@ class Puller:
         except Exception as e:
             log.debug("%s progress write failed: %s", self.tag, describe(e))
 
+    def report_idle_status(self):
+        if self.problems:
+            self.status("error", " | ".join(self.problems.values()))
+        else:
+            self.status("up to date", "watching for new mail")
+
+    def problem(self, name, message=None):
+        """Set (message) or clear (None) a guard problem for the admin page."""
+        before = dict(self.problems)
+        if message and self.problems.get(name) != message:
+            log.warning("%s %s", self.tag, message)
+        if message:
+            self.problems[name] = message
+        else:
+            self.problems.pop(name, None)
+        if self.problems != before:
+            self.report_idle_status()   # show / clear it on the admin page right away
+
     def local_count(self, folder):
         if self.local_selected == folder:
             self.local.noop()
@@ -142,13 +170,13 @@ class Puller:
                 return
             self.inbox_event.clear()
             self.sync_folder("INBOX", reason="new mail" if triggered else None)
-            self.status("up to date", "watching for new mail")
+            self.report_idle_status()
 
             now = time.time()
             if now - last_others >= OTHER_FOLDERS_SECONDS:
                 self.sync_all_folders(skip_inbox=True)
                 last_others = time.time()
-                self.status("up to date", "watching for new mail")
+                self.report_idle_status()
             if now - last_discovery >= FOLDER_DISCOVERY_SECONDS:
                 self.discover_folders()
                 last_discovery = time.time()
@@ -170,6 +198,7 @@ class Puller:
                 check_remote_host(self.acc)
                 with IMAPClient(self.acc.imap_host, port=self.acc.imap_port, ssl=True,
                                 ssl_context=remote_ssl_context(), timeout=90) as client:
+                    lock_down_idle_client(client)  # login / EXAMINE / NOOP / LOGOUT only
                     client.login(self.acc.email, self.acc.hostinger_password)
                     client.select_folder("INBOX", readonly=True)
                     backoff.reset()
@@ -304,12 +333,21 @@ class Puller:
                     if r.uid not in known]
             for r in recs:
                 r.key = msg_key(r.data)
-            existing = self.local_lookup(folder, [r.key for r in recs])
+            # Match by COUNT, never collapse duplicates: if Hostinger has the
+            # same Message-ID twice and Roundcube has it once, the second
+            # copy is downloaded. A local copy counts as "already here" only
+            # while it isn't already linked to another Hostinger copy.
+            keys = [r.key for r in recs]
+            copies = self.local_copies(folder, keys)
+            taken = self.mapped_counts(folder, keys)
 
             map_rows, to_copy = [], []
             for r in recs:
-                if r.key and r.key in existing:
-                    luid, lflags = existing[r.key]
+                local = copies.get(r.key, []) if r.key else []
+                n_taken = taken.get(r.key, 0)
+                if r.key and n_taken < len(local):
+                    luid, lflags = local[n_taken]
+                    taken[r.key] = n_taken + 1
                     if r.flags is not None and tracked(lflags) != tracked(r.flags):
                         self.set_local_flags(folder, luid, lflags, r.flags)
                     map_rows.append((self.acc.email, folder, r.uid, r.key, flags_to_db(r.flags)))
@@ -386,20 +424,50 @@ class Puller:
             "SELECT remote_uid, msg_key FROM sync_msg_map WHERE account_email=%s AND folder=%s",
             (self.acc.email, folder))
         gone = [(int(u), k) for u, k in mapped if int(u) <= last_uid and int(u) not in present]
+        guard = f"del:{folder}"
         if not gone:
+            self.problem(guard, None)
+            self.db.guard_clear(self.acc.email, guard)
             return
-        if len(gone) > max(25, len(mapped) // 2):
-            log.warning("%s %s: %d of %d messages look gone on Hostinger -- too many at once, "
-                        "treating as a glitch and doing nothing", self.tag, folder, len(gone), len(mapped))
+        if not present or len(gone) > REMOTE_DELETE_MAX_PER_PASS:
+            # Could be a real bulk delete (phone/webmail) or a bad server
+            # answer. Wait until it has stayed the same for a while (or the
+            # admin approves) before acting on it.
+            msg = (f"{folder}: {len(gone)} mails disappeared from Hostinger at once -- "
+                   f"waiting {GUARD_CONFIRM_MINUTES} min to confirm"
+                   + (" before moving the local copies to Trash" if DELETE_LOCAL_ON_REMOTE_DELETE else "")
+                   + " (or press Approve)")
+            if not self.db.guard_decide(self.acc.email, guard, msg, len(gone), GUARD_CONFIRM_MINUTES):
+                # only worth a warning if local mail would be touched
+                self.problem(guard, msg if DELETE_LOCAL_ON_REMOTE_DELETE else None)
+                return
+            log.info("%s %s: bulk delete of %d confirmed -- applying", self.tag, folder, len(gone))
+        self.problem(guard, None)
+        confirmed = set(self.confirm_gone(folder, [u for u, _k in gone]))
+        gone = [(u, k) for u, k in gone if u in confirmed]
+        if not gone:
             return
         removed = 0
         if DELETE_LOCAL_ON_REMOTE_DELETE:
-            existing = self.local_lookup(folder, [k for _u, k in gone])
-            luids = [existing[k][0] for _u, k in gone if k in existing]
+            # per key: remove only as many local copies as Hostinger lost,
+            # and never more than would leave fewer copies than Hostinger has
+            gone_count = {}
+            for _u, k in gone:
+                if k:
+                    gone_count[k] = gone_count.get(k, 0) + 1
+            copies = self.local_copies(folder, list(gone_count))
+            still = {}
+            for k in gone_count:
+                still[k] = len(uid_search(self.remote, "HEADER", "MESSAGE-ID", q(k))) if is_message_id(k) else 0
+            luids = []
+            for k, lst in copies.items():
+                # local copies beyond what Hostinger still has, capped at how
+                # many Hostinger actually lost
+                n = min(max(0, len(lst) - still.get(k, 0)), gone_count[k])
+                if n:
+                    luids.extend(u for u, _f in lst[-n:])
             if luids:
-                self.select_local(folder)
-                check(*self.local.uid("STORE", uidset(luids), "+FLAGS.SILENT", "(\\Deleted)"), "local STORE")
-                check(*self.local.uid("EXPUNGE", uidset(luids)), "local UID EXPUNGE")
+                self.trash_local(folder, luids)   # recoverable in Roundcube's Trash
                 removed = len(luids)
         for part in chunks([u for u, _k in gone], 500):
             self.db.execute(
@@ -407,7 +475,7 @@ class Puller:
                 f"AND remote_uid IN ({','.join(['%s'] * len(part))})",
                 (self.acc.email, folder, *part))
         log.info("%s %s: %d message(s) were deleted on Hostinger -- %s", self.tag, folder, len(gone),
-                 f"removed {removed} local copies" if DELETE_LOCAL_ON_REMOTE_DELETE
+                 f"moved {removed} local copies to Trash" if DELETE_LOCAL_ON_REMOTE_DELETE
                  else "local copies kept (DELETE_LOCAL_ON_REMOTE_DELETE=0)")
 
     # ------------------------------------------------------------------
@@ -434,6 +502,29 @@ class Puller:
         self.select_local(folder)
         check(*self.local.uid("STORE", uidset(luids), "+FLAGS.SILENT", "(\\Deleted)"), "local STORE")
         check(*self.local.uid("EXPUNGE", uidset(luids)), "local UID EXPUNGE")
+
+    def trash_local(self, folder, luids):
+        """Sync-driven local removal = MOVE to the local Trash (recoverable in
+        Roundcube), never a hard delete. Only mail already in Trash is expunged."""
+        if not luids:
+            return
+        if folder == TRASH_FOLDER:
+            self.expunge_local(folder, luids)
+            return
+        try:
+            self.local.create(q(TRASH_FOLDER))
+        except Exception:
+            pass  # usually exists already
+        self.select_local(folder)
+        check(*self.local.uid("MOVE", uidset(luids), q(TRASH_FOLDER)), f"local MOVE to {TRASH_FOLDER}")
+
+    def confirm_gone(self, folder, uids):
+        """Re-check on a refreshed session that these Hostinger UIDs are
+        really gone. Returns only the ones confirmed missing."""
+        self.remote.noop()
+        self.examine_remote(folder)
+        still = set(uid_search(self.remote, "UID", uidset(uids))) if uids else set()
+        return [u for u in uids if u not in still]
 
     def pull_drafts(self, last_uid):
         """New UIDs in Hostinger's Drafts: a draft written or edited on
@@ -492,15 +583,25 @@ class Puller:
         present = set(uid_search(self.remote, "ALL"))
         gone = {k: v for k, v in states.items() if v[0] not in present}
         if not gone:
+            self.problem("drafts", None)
+            self.db.guard_clear(self.acc.email, "pull-drafts")
             return
-        if len(gone) > 25 and len(gone) == len(states):
-            log.warning("%s all %d drafts look gone on Hostinger -- treating as a glitch", self.tag, len(gone))
-            return
+        if len(gone) > DRAFT_VANISH_LIMIT and (not present or len(gone) > len(states) // 2):
+            msg = (f"{len(gone)} of {len(states)} drafts disappeared from Hostinger at once -- waiting "
+                   f"{GUARD_CONFIRM_MINUTES} min to confirm before moving the Roundcube copies to Trash "
+                   f"(or press Approve)")
+            if not self.db.guard_decide(self.acc.email, "pull-drafts", msg, len(gone), GUARD_CONFIRM_MINUTES):
+                self.problem("drafts", msg)
+                return
+            log.info("%s drafts: bulk removal of %d confirmed -- applying", self.tag, len(gone))
+        self.problem("drafts", None)
+        confirmed = set(self.confirm_gone(DRAFTS_FOLDER, [v[0] for v in gone.values()]))
+        gone = {k: v for k, v in gone.items() if v[0] in confirmed}
         removed = kept = 0
         for key, (ruid, h, _origin) in gone.items():
             local = self.local_draft_copies(key)
             same = [lu for lu, lh in local.items() if lh == h]
-            self.expunge_local(DRAFTS_FOLDER, same)
+            self.trash_local(DRAFTS_FOLDER, same)   # recoverable in Roundcube's Trash
             removed += len(same)
             if len(same) < len(local):
                 kept += 1  # edited locally -> sync-push re-uploads it
@@ -510,7 +611,7 @@ class Puller:
                 self.db.execute("DELETE FROM sync_draft_state WHERE account_email=%s AND msg_key=%s "
                                 "AND remote_uid=%s", (acc, key, ruid))
             self.db.delete_map_uids(acc, DRAFTS_FOLDER, [ruid])
-        log.info("%s drafts removed on Hostinger: %d local cop(ies) removed, %d kept (edited locally)",
+        log.info("%s drafts removed on Hostinger: %d local cop(ies) moved to Trash, %d kept (edited locally)",
                  self.tag, removed, kept)
 
     # ------------------------------------------------------------------
@@ -541,6 +642,46 @@ class Puller:
             k = msg_key(r.data)
             if k in found:
                 out[k] = (r.uid, r.flags or frozenset())
+        return out
+
+    def local_copies(self, folder, keys):
+        """{key: [(local_uid, flags), ...]} -- EVERY local copy of each key
+        (a folder can legitimately hold the same Message-ID more than once)."""
+        keys = [k for k in set(keys) if k]
+        if not keys:
+            return {}
+        self.select_local(folder)
+        out = {}
+        if len(keys) > INDEX_THRESHOLD or any(not is_message_id(k) for k in keys):
+            wanted = set(keys)
+            for r in uid_fetch(self.local, "1:*", f"UID FLAGS {HEADER_ITEM}"):
+                k = msg_key(r.data)
+                if k in wanted:
+                    out.setdefault(k, []).append((r.uid, r.flags or frozenset()))
+        else:
+            uids = {}
+            for k in keys:
+                for u in uid_search(self.local, "HEADER", "MESSAGE-ID", q(k)):
+                    uids[u] = k
+            if uids:
+                for r in uid_fetch(self.local, uidset(uids), f"UID FLAGS {HEADER_ITEM}"):
+                    k = msg_key(r.data)
+                    if k == uids.get(r.uid):
+                        out.setdefault(k, []).append((r.uid, r.flags or frozenset()))
+        for k in out:
+            out[k].sort()
+        return out
+
+    def mapped_counts(self, folder, keys):
+        """How many Hostinger copies of each key are already linked to a
+        local copy (so those local copies are 'taken')."""
+        out = {}
+        for part in chunks([k for k in set(keys) if k], 500):
+            rows = self.db.fetchall(
+                "SELECT msg_key, COUNT(*) FROM sync_msg_map WHERE account_email=%s AND folder=%s "
+                f"AND msg_key IN ({','.join(['%s'] * len(part))}) GROUP BY msg_key",
+                (self.acc.email, folder, *part))
+            out.update({k: int(n) for k, n in rows})
         return out
 
     def set_local_flags(self, folder, luid, current, wanted):

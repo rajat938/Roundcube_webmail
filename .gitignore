@@ -1,2 +1,17 @@
-maildir
-maildir/*
+# ---- secrets: never commit ----
+.env
+*.bak
+www/config/config.docker.inc.php
+www/config/config.old.php
+
+# ---- data ----
+mail-mirror/
+maildir/
+www/logs/*
+!www/logs/.htaccess
+www/temp/*
+!www/temp/.htaccess
+
+# ---- junk ----
+*.zip
+__pycache__/
