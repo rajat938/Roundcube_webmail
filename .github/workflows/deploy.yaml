@@ -71,3 +71,17 @@ jobs:
           ignore-unfixed: true
           format: table
           exit-code: "1"
+ 
+  
+ 
+ Deploy:
+  Runs-on: self-hosted
+  needs: [Build, Test_images]
+  steps:
+    - uses: actions/checkout@v6
+  
+    - name: Deploy to server 
+      run: |
+       cd ~/project/RoundCube_Mail-main
+       docker compose up -d --build 
+       
