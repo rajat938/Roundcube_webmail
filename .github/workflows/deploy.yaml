@@ -75,7 +75,7 @@ jobs:
   
  
  Deploy:
-  Runs-on: self-hosted
+  runs-on: self-hosted
   needs: [Build, Test_images]
   steps:
     - uses: actions/checkout@v6
@@ -84,4 +84,3 @@ jobs:
       run: |
        cd ~/project/RoundCube_Mail-main
        docker compose up -d --build 
-       
