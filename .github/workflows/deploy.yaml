@@ -54,10 +54,10 @@ jobs:
       exit-code: "1"
 
 
-  test_images:
+ Test_images:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false          # ek image fail ho to baaki ka result bhi dikhe
+      fail-fast: false         
       matrix:
         image: [sync, account-manager, monitor]
     steps:
@@ -67,7 +67,7 @@ jobs:
         run: docker build -t ${{ matrix.image }}:ci ./${{ matrix.image }}
  
       - name: Trivy scan (${{ matrix.image }} image)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 
         with:
           scan-type: image
           image-ref: ${{ matrix.image }}:ci
