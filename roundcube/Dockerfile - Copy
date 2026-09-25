@@ -1,0 +1,6 @@
+FROM roundcube/roundcubemail:latest
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
